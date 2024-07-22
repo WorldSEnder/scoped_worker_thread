@@ -124,6 +124,20 @@ impl<T> Remote<T> {
         self.done.send(()).expect("host should be present")
     }
 }
+fn sync_remote_control<T>() -> (Controller<T>, Remote<T>) {
+    let (send, recv) = sync_channel(1);
+    let (send_done, recv_done) = sync_channel(1);
+    (
+        Controller {
+            send,
+            done: recv_done,
+        },
+        Remote {
+            recv,
+            done: send_done,
+        },
+    )
+}
 
 #[derive(Debug)]
 pub enum JoinError {
@@ -149,16 +163,7 @@ pub struct Worker {
 
 impl Worker {
     pub fn spawn() -> Self {
-        let (send, recv) = sync_channel(1);
-        let (send_done, recv_done) = sync_channel(1);
-        let control = Controller {
-            send,
-            done: recv_done,
-        };
-        let mut remote = Remote {
-            recv,
-            done: send_done,
-        };
+        let (control, mut remote) = sync_remote_control();
 
         let worker = spawn(move || loop {
             match remote.recv() {
