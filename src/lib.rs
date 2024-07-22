@@ -1,9 +1,9 @@
 //! A worker thread is similar to a [thread scope] in that it can be sent units of work.
 //!
-//! Every worker thread is owned by whichever thread has spawned it and can be sent
-//! closures to work on sending the result back. The main feature is that these closures
-//! are allowed to borrow (mutably) memory from the master thread and synchronize
-//! after the work is finished to release the borrow back to the master.
+//! Every worker is owned by whichever thread has spawned it and can be sent
+//! closures to work on, and sends their results back. The main feature is that these closures
+//! are allowed to borrow (mutably) memory from the spawning thread and synchronize
+//! after the work is finished to release the borrow.
 //!
 //! # Example
 //!
@@ -65,7 +65,7 @@ impl<'scope, T> ScopedJoinHandle<'scope, T> {
     ///
     /// If the associated thread panics, [`Err`] is returned with the panic payload.
     ///
-    /// [*happens before*](https://doc.rust-lang.org/nomicon/atomics.html#data-accesses)
+    /// [*happens before*]: https://doc.rust-lang.org/nomicon/atomics.html#data-accesses
     pub fn join(self) -> std::thread::Result<T> {
         self.result.join()
     }
@@ -158,11 +158,11 @@ impl<'scope, 'env> Scope<'scope, 'env> {
     }
 }
 
-/// Create a scope for submitting units-of-work to [`Worker`].
+/// Create a scope for submitting units-of-work to [`Worker`]s.
 ///
 /// The function passed to [`scope`] will be provided a [`Scope`] object, through which scoped units of work can be submitted.
 ///
-/// All work will be finished on the worker threads by the time [`scope`] returns, but the worker thread will continue running.
+/// All work will be finished on the worker threads by the time [`scope`] returns, but the worker threads will continue running.
 ///
 /// Work closures can borrow non-`'static` data, as the scope guarantees that all borrows are returned at the end of the scope and are non-overlapping.
 ///
