@@ -83,7 +83,7 @@ impl<T, F: FnOnce(&ResultStorage<T>)> UnitOfWork for Packet<T, F> {
         // SAFETY: the worker thread is the only place to access the work after construction.
         let work = unsafe { &mut *self.work.get() };
         // SAFETY: this function gets only called once. Hence, the value is populated when this gets called from initialization.
-        let work = ManuallyDrop::take(work);
+        let work = unsafe { ManuallyDrop::take(work) };
         work(&self.result);
     }
 }
