@@ -5,6 +5,36 @@
 //! are allowed to borrow (mutably) memory from the master thread and synchronize
 //! after the work is finished to release the borrow back to the master.
 //!
+//! # Example
+//!
+//! ```
+//! use scoped_worker_thread::{Worker, scope};
+//!
+//! let mut worker1 = Worker::spawn();
+//! let mut worker2 = Worker::spawn();
+//!
+//! // Store these workers somewhere, then later ....
+//!
+//! let mut result = [0; 4];
+//! let (left, right) = result.split_at_mut(2);
+//! scope(|scope| {
+//!     scope.send(&mut worker1, || {
+//!         // This work happens on the first worker's thread
+//!         left.fill(1);
+//!     });
+//!     scope.send(&mut worker2, || {
+//!         // This work happens on the second worker's thread
+//!         right.fill(2);
+//!     });
+//! });
+//! assert_eq!(result, [1, 1, 2, 2]);
+//!
+//! // ... again later, clean up the workers.
+//!
+//! worker1.join();
+//! worker2.join();
+//! ```
+//!
 //! [thread scope]: std::thread::scope
 
 use std::marker::PhantomData;
@@ -14,16 +44,29 @@ use std::thread::{current, park, Thread};
 
 mod worker;
 
+pub use worker::Worker;
 use worker::{new_packet, ClaimedWorker};
-pub use worker::{JoinError, Worker};
 
+/// An owned permission to wait for a piece of work to finish by blocking.
+///
+/// See [Scope::send] for details.
 pub struct ScopedJoinHandle<'scope, T> {
     result: ClaimedWorker<'scope, T>,
     scope: PhantomData<&'scope mut &'scope ()>,
 }
 
 impl<'scope, T> ScopedJoinHandle<'scope, T> {
-    pub fn join(self) -> Result<T, JoinError> {
+    /// Waits for the associated work to finish.
+    ///
+    /// The will return immediately if the associated work has already been completed.
+    ///
+    /// For memory ordering, all operations performed in the work item have a [*happens before*] relationship
+    /// with the function returning.
+    ///
+    /// If the associated thread panics, [`Err`] is returned with the panic payload.
+    ///
+    /// [*happens before*](https://doc.rust-lang.org/nomicon/atomics.html#data-accesses)
+    pub fn join(self) -> std::thread::Result<T> {
         self.result.join()
     }
 }
@@ -36,8 +79,15 @@ struct ScopeData {
 
 impl ScopeData {
     fn start_worker(&self) {
-        let _ = self.num_active_workers.fetch_add(1, Ordering::Relaxed);
-        // TODO: panic when too many workers are active!
+        let active_count = self.num_active_workers.fetch_add(1, Ordering::Relaxed);
+        // This is the only thread that adds to the count, hence this check is sufficient.
+        if active_count + 1 == usize::MAX {
+            self.overflow()
+        }
+    }
+    #[cold]
+    fn overflow(&self) {
+        panic!("too many active workers");
     }
     fn finish_worker(&self, unwinding: bool) {
         if unwinding {
@@ -61,6 +111,9 @@ impl ScopeData {
     }
 }
 
+/// A scope during which to perform work.
+///
+/// See [`scope`] for details.
 pub struct Scope<'scope, 'env>
 where
     'env: 'scope,
@@ -72,7 +125,24 @@ where
 }
 
 impl<'scope, 'env> Scope<'scope, 'env> {
-    pub fn send<T, F>(&mut self, worker: &'scope mut Worker, task: F) -> ScopedJoinHandle<'scope, T>
+    // TODO: we could - either unsafely, or with a RefCell - allow a worker to work on multiple pieces of work.
+    //       The current design takes unique ownership of the worker thread and *must* wait for that piece of work to complete
+    //       before `join` can return. Since there is no causal relation between joining the handle and the worker borrow, we can't
+    //       safely "return" the borrow to the worker until the end-of-scope. Since dropping the join handle will *not* wait for
+    //       the work to finish, we can't 'just' tack on another lifetime onto the handle to establish this ownership and must pretend
+    //       to always hold it until the end of the scope.
+    /// Send some work to a worker, returning a [`ScopedJoinHandle`] for it.
+    ///
+    /// The closure can borrow non-`'static` data from outside the scope.
+    ///
+    /// The join handle has a [`join`](ScopedJoinHandle::join) method to synchronously wait for the submitted task to complete. If the
+    /// task panics, joining it will return an [`Err`].
+    ///
+    /// If the join handle is dropped without joining it, the task will be implicitly joined at the end of the scope. In this case,
+    /// [`scope`] will panic after all workers have finished.
+    ///
+    /// Note that no additional threads are spawned. Every [`Worker`] can only be used once per [`scope`] and work on one unit of work.
+    pub fn send<T, F>(&self, worker: &'scope mut Worker, task: F) -> ScopedJoinHandle<'scope, T>
     where
         F: 'scope + Send + FnOnce() -> T,
         T: 'scope + Send,
@@ -88,6 +158,37 @@ impl<'scope, 'env> Scope<'scope, 'env> {
     }
 }
 
+/// Create a scope for submitting units-of-work to [`Worker`].
+///
+/// The function passed to [`scope`] will be provided a [`Scope`] object, through which scoped units of work can be submitted.
+///
+/// All work will be finished on the worker threads by the time [`scope`] returns, but the worker thread will continue running.
+///
+/// Work closures can borrow non-`'static` data, as the scope guarantees that all borrows are returned at the end of the scope and are non-overlapping.
+///
+/// All work that has not been explicitly [joined](ScopedJoinHandle::join) will be implicitly waited for at the end of the scope.
+///
+/// # Example
+///
+/// ```
+/// use scoped_worker_thread::{Worker, scope};
+///
+/// let mut worker1 = Worker::spawn();
+/// let mut worker2 = Worker::spawn();
+/// let mut result = [0; 4];
+/// let (left, right) = result.split_at_mut(2);
+/// scope(|scope| {
+///     scope.send(&mut worker1, || {
+///         left.fill(1);
+///     });
+///     scope.send(&mut worker2, || {
+///         right.fill(2);
+///     });
+/// });
+/// assert_eq!(result, [1, 1, 2, 2]);
+/// worker1.join();
+/// worker2.join();
+/// ```
 pub fn scope<'env, F, T>(f: F) -> T
 where
     F: 'env + for<'scope> FnOnce(Scope<'scope, 'env>) -> T,

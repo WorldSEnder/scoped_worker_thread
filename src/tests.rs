@@ -8,7 +8,7 @@ fn example() {
     let mut result2 = 0;
 
     let hostid = std::thread::current().id();
-    scope(|mut scope| {
+    scope(|scope| {
         scope.send(&mut worker1, || {
             assert_ne!(std::thread::current().id(), hostid);
             result1 = 42;
@@ -20,4 +20,6 @@ fn example() {
     });
     assert!(result1 == 42);
     assert!(result2 == 42);
+    worker1.join();
+    worker2.join();
 }

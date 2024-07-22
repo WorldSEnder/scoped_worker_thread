@@ -1,5 +1,4 @@
 use std::{
-    any::Any,
     cell::UnsafeCell,
     mem::ManuallyDrop,
     panic::{catch_unwind, AssertUnwindSafe},
@@ -7,7 +6,7 @@ use std::{
         mpsc::{sync_channel, Receiver, SyncSender},
         Arc,
     },
-    thread::{spawn, JoinHandle},
+    thread::JoinHandle,
 };
 
 // A trait that is morally equivalent to `FnOnce()` that we can implement for our own structures.
@@ -20,6 +19,12 @@ pub trait UnitOfWork {
 enum WorkItem {
     Task(Arc<dyn 'static + Sync + Send + UnitOfWork>),
     Terminate,
+}
+
+impl Default for WorkItem {
+    fn default() -> Self {
+        Self::Terminate
+    }
 }
 
 pub struct ResultStorage<T> {
@@ -67,15 +72,6 @@ pub fn new_packet<T>(
     }
 }
 
-impl<T, F> Packet<T, F> {
-    pub fn new(f: F) -> Self {
-        Self {
-            result: ResultStorage::new(),
-            work: UnsafeCell::new(ManuallyDrop::new(f)),
-        }
-    }
-}
-
 unsafe impl<T: Send, F: ?Sized> Send for Packet<T, F> {}
 unsafe impl<T: Send, F: ?Sized> Sync for Packet<T, F> {}
 
@@ -116,8 +112,13 @@ impl<T> Controller<T> {
     }
 }
 impl<T> Remote<T> {
-    fn recv(&mut self) -> T {
-        self.recv.recv().expect("host should be present")
+    // Return T::default() when the host disconnects. This can happen when the worker thread gets detached.
+    // In this case, we should terminate the worker "as-soon-as-possible"(TM).
+    fn recv(&mut self) -> T
+    where
+        T: Default,
+    {
+        self.recv.recv().unwrap_or_default()
     }
     // SAFETY: must drop the previously received item before calling
     unsafe fn done(&mut self) {
@@ -138,10 +139,18 @@ fn sync_remote_control<T>() -> (Controller<T>, Remote<T>) {
         },
     )
 }
-
-#[derive(Debug)]
-pub enum JoinError {
-    WorkPanicked(Box<dyn Any + Send + 'static>),
+fn work_loop(mut remote: Remote<WorkItem>) -> impl FnOnce() {
+    move || loop {
+        match remote.recv() {
+            WorkItem::Task(task) => {
+                // SAFETY: work has not been called before
+                unsafe { task.work() }
+            }
+            WorkItem::Terminate => break,
+        }
+        // SAFETY: received item has been dropped
+        unsafe { remote.done() }
+    }
 }
 
 pub struct ClaimedWorker<'scope, T> {
@@ -150,39 +159,76 @@ pub struct ClaimedWorker<'scope, T> {
 }
 
 impl<'scope, T> ClaimedWorker<'scope, T> {
-    pub fn join(self) -> Result<T, JoinError> {
+    pub fn join(self) -> std::thread::Result<T> {
         self.barrier.recv().expect("Worker exited unexpectedly");
-        self.packet.result.claim().map_err(JoinError::WorkPanicked)
+        self.packet.result.claim()
     }
 }
 
-pub struct Worker {
-    thread: ManuallyDrop<JoinHandle<()>>,
+// LET ME WRITE std::thread::ScopedJoinHandle<'static>, I don't care about the variants.
+enum WorkerHandle<'thread> {
+    Static(JoinHandle<()>), // In this case, 'thread = 'static
+    Scoped(std::thread::ScopedJoinHandle<'thread, ()>),
+}
+
+/// A thread dedicated to performing work sent in a [`scope`](crate::scope).
+pub struct Worker<'thread> {
+    thread: WorkerHandle<'thread>,
     control: Controller<WorkItem>,
 }
 
-impl Worker {
+impl Worker<'static> {
+    /// Spawn a new worker with default settings.
+    ///
+    /// Like [`Thread`](std::thread::Thread), the [`Worker`] is implicitly detached when it is dropped without joining it.
+    /// Despite this, some care is taken to trigger the worker-thread to clean up after itself, but no synchronization with this clean-up is performed.
     pub fn spawn() -> Self {
-        let (control, mut remote) = sync_remote_control();
-
-        let worker = spawn(move || loop {
-            match remote.recv() {
-                WorkItem::Task(task) => {
-                    // SAFETY: work has not been called before
-                    unsafe { task.work() }
-                }
-                WorkItem::Terminate => break,
-            }
-            // SAFETY: received item has been dropped
-            unsafe { remote.done() }
-        });
-        Self {
-            thread: ManuallyDrop::new(worker),
+        Self::with_builder(std::thread::Builder::new()).unwrap()
+    }
+    /// Spawn a new work from a given thread builder.
+    pub fn with_builder(builder: std::thread::Builder) -> std::io::Result<Self> {
+        let (control, remote) = sync_remote_control();
+        let handle = builder.spawn(work_loop(remote))?;
+        Ok(Self {
+            thread: WorkerHandle::Static(handle),
             control,
+        })
+    }
+}
+impl<'thread> Worker<'thread> {
+    /// Spawn a new worker with default settings in a scope.
+    pub fn spawn_scoped(scope: &'thread std::thread::Scope<'thread, '_>) -> Self {
+        Self::with_builder_scoped(std::thread::Builder::new(), scope).unwrap()
+    }
+    /// Spawn a new worker from a given thread builder in a scope.
+    pub fn with_builder_scoped(
+        builder: std::thread::Builder,
+        scope: &'thread std::thread::Scope<'thread, '_>,
+    ) -> std::io::Result<Self> {
+        let (control, remote) = sync_remote_control();
+        let handle = builder.spawn_scoped(scope, work_loop(remote))?;
+        Ok(Self {
+            thread: WorkerHandle::Scoped(handle),
+            control,
+        })
+    }
+    /// Join a worker and synchronize with the thread termination.
+    pub fn join(self) {
+        let mut this = ManuallyDrop::new(self);
+        // SAFETY: run the drop impl, but keep the thread handle alive.
+        let thread = unsafe { std::ptr::read(&this.thread) };
+        this.control.send(WorkItem::Terminate);
+        unsafe { std::ptr::drop_in_place(&mut this.control) };
+        match thread {
+            WorkerHandle::Static(handle) => handle.join().unwrap(),
+            WorkerHandle::Scoped(handle) => handle.join().unwrap(),
         }
     }
-
-    pub fn submit<'scope, T, F>(&'scope mut self, packet: Packet<T, F>) -> ClaimedWorker<'scope, T>
+    /// Submit a unit of work to the worker and claim it.
+    pub(crate) fn submit<'scope, T, F>(
+        &'scope mut self,
+        packet: Packet<T, F>,
+    ) -> ClaimedWorker<'scope, T>
     where
         Packet<T, F>: UnitOfWork,
         F: 'scope + Send,
@@ -201,9 +247,8 @@ impl Worker {
     }
 }
 
-impl Drop for Worker {
+impl Drop for Worker<'_> {
     fn drop(&mut self) {
         let _barrier = self.control.send(WorkItem::Terminate);
-        let _ = unsafe { ManuallyDrop::take(&mut self.thread) }.join();
     }
 }
