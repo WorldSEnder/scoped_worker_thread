@@ -44,6 +44,7 @@ impl<T> ResultStorage<T> {
         }
     }
     fn claim(&self) -> std::thread::Result<T> {
+        // SAFETY: only called on the master thread when joining. We first wait for the worker to store a result.
         unsafe { (*self.result.get()).take() }.expect("should have a stored result")
     }
 }
@@ -63,7 +64,6 @@ pub fn new_packet<T>(
         let unwinding = result.is_err();
         storage.store(result);
         synchronize_result(unwinding);
-        // TODO: signal scope
     };
 
     Packet {
@@ -72,12 +72,15 @@ pub fn new_packet<T>(
     }
 }
 
-unsafe impl<T: Send, F: ?Sized> Send for Packet<T, F> {}
-unsafe impl<T: Send, F: ?Sized> Sync for Packet<T, F> {}
+// SAFETY: The packet is only read on two threads: the worker thread and the main thread. Borrows do not overlap, the shared ref is only used to Send data
+// between these. Hence, both the return value type `T` and the closure `F` need to be `Send` but not `Sync`.
+unsafe impl<T: Send, F: ?Sized + Send> Send for Packet<T, F> {}
+// SAFETY: See reasoning on Send.
+unsafe impl<T: Send, F: ?Sized + Send> Sync for Packet<T, F> {}
 
 impl<T, F: FnOnce(&ResultStorage<T>)> UnitOfWork for Packet<T, F> {
     unsafe fn work(&self) {
-        // SAFETY: the worker thread is the only place to access the work.
+        // SAFETY: the worker thread is the only place to access the work after construction.
         let work = unsafe { &mut *self.work.get() };
         // SAFETY: this function gets only called once. Hence, the value is populated when this gets called from initialization.
         let work = ManuallyDrop::take(work);
@@ -212,12 +215,17 @@ impl<'thread> Worker<'thread> {
             control,
         })
     }
+    fn trigger_cleanup(&mut self) {
+        let _barrier = self.control.send(WorkItem::Terminate);
+    }
     /// Join a worker and synchronize with the thread termination.
-    pub fn join(self) {
+    pub fn join(mut self) {
+        // Note the order: we first send the termination signal, then manually run clean-up.
+        // Running the drop-impl would detach the thread! Don't do that, as it invalidates the handle we want to join!
+        self.trigger_cleanup();
         let mut this = ManuallyDrop::new(self);
         // SAFETY: run the drop impl, but keep the thread handle alive.
         let thread = unsafe { std::ptr::read(&this.thread) };
-        this.control.send(WorkItem::Terminate);
         unsafe { std::ptr::drop_in_place(&mut this.control) };
         match thread {
             WorkerHandle::Static(handle) => handle.join().unwrap(),
@@ -236,7 +244,7 @@ impl<'thread> Worker<'thread> {
     {
         let our_packet = Arc::new(packet);
         let their_packet: Arc<dyn UnitOfWork + Send + Sync> = our_packet.clone();
-        // SAFETY: we prolong the lifetime of the borrow
+        // SAFETY: we merely prolong the lifetime of the borrow. This lifetime is threaded into the ClaimedWorker struct.
         let their_packet = unsafe { Arc::from_raw(Arc::into_raw(their_packet) as *mut _) };
         let item = WorkItem::Task(their_packet);
         let barrier = self.control.send(item);
@@ -249,6 +257,7 @@ impl<'thread> Worker<'thread> {
 
 impl Drop for Worker<'_> {
     fn drop(&mut self) {
-        let _barrier = self.control.send(WorkItem::Terminate);
+        self.trigger_cleanup();
+        // ... futher drop impl of the thread handle detaches it.
     }
 }
