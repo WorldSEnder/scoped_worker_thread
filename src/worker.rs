@@ -127,7 +127,7 @@ impl<T> Remote<T> {
 
 #[derive(Debug)]
 pub enum JoinError {
-    UnwindError(Box<dyn Any + Send + 'static>),
+    WorkPanicked(Box<dyn Any + Send + 'static>),
 }
 
 pub struct ClaimedWorker<'scope, T> {
@@ -138,7 +138,7 @@ pub struct ClaimedWorker<'scope, T> {
 impl<'scope, T> ClaimedWorker<'scope, T> {
     pub fn join(self) -> Result<T, JoinError> {
         self.barrier.recv().expect("Worker exited unexpectedly");
-        self.packet.result.claim().map_err(JoinError::UnwindError)
+        self.packet.result.claim().map_err(JoinError::WorkPanicked)
     }
 }
 

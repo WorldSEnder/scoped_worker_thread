@@ -4,6 +4,8 @@
 //! closures to work on sending the result back. The main feature is that these closures
 //! are allowed to borrow (mutably) memory from the master thread and synchronize
 //! after the work is finished to release the borrow back to the master.
+//!
+//! [thread scope]: std::thread::scope
 
 use std::marker::PhantomData;
 use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
@@ -70,11 +72,11 @@ where
 }
 
 impl<'scope, 'env> Scope<'scope, 'env> {
-    pub fn send<T: 'scope + Send>(
-        &mut self,
-        worker: &'scope mut Worker,
-        task: impl 'scope + Send + FnOnce() -> T,
-    ) -> ScopedJoinHandle<'scope, T> {
+    pub fn send<T, F>(&mut self, worker: &'scope mut Worker, task: F) -> ScopedJoinHandle<'scope, T>
+    where
+        F: 'scope + Send + FnOnce() -> T,
+        T: 'scope + Send,
+    {
         // We could bump-alloc from a buffer in Scope. Since threads are basically not usable without `alloc`, we are lazy and use a box.
         let packet = new_packet(task, |unwinding| self.data.finish_worker(unwinding));
         self.data.start_worker();
