@@ -215,18 +215,12 @@ impl<'thread> Worker<'thread> {
             control,
         })
     }
-    fn trigger_cleanup(&mut self) {
-        let _barrier = self.control.send(WorkItem::Terminate);
-    }
     /// Join a worker and synchronize with the thread termination.
-    pub fn join(mut self) {
+    pub fn join(self) {
         // Note the order: we first send the termination signal, then manually run clean-up.
-        // Running the drop-impl would detach the thread! Don't do that, as it invalidates the handle we want to join!
-        self.trigger_cleanup();
-        let mut this = ManuallyDrop::new(self);
-        // SAFETY: run the drop impl, but keep the thread handle alive.
-        let thread = unsafe { std::ptr::read(&this.thread) };
-        unsafe { std::ptr::drop_in_place(&mut this.control) };
+        let Self { control, thread } = self;
+        // dropping our control will cause the worker to recv Terminate
+        drop(control);
         match thread {
             WorkerHandle::Static(handle) => handle.join().unwrap(),
             WorkerHandle::Scoped(handle) => handle.join().unwrap(),
@@ -252,12 +246,5 @@ impl<'thread> Worker<'thread> {
             barrier,
             packet: our_packet,
         }
-    }
-}
-
-impl Drop for Worker<'_> {
-    fn drop(&mut self) {
-        self.trigger_cleanup();
-        // ... futher drop impl of the thread handle detaches it.
     }
 }
