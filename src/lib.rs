@@ -5,6 +5,9 @@
 //! are allowed to borrow (mutably) memory from the spawning thread and synchronize
 //! after the work is finished to release the borrow.
 //!
+//! This is mainly useful when repeatedly performing work you want to parallelize without having
+//! to pay the cost of starting and stopping new threads every time a `scope` is entered.
+//!
 //! # Example
 //!
 //! ```
