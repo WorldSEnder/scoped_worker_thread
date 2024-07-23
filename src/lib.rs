@@ -79,6 +79,9 @@ struct ScopeData {
 
 impl ScopeData {
     fn start_worker(&self) {
+        // This store has a happens-before relationship with the corresponding subtraction in `finish_worker`
+        // via the passing of the work item over the shared channel. Notice that we first count up,
+        // and then send the work.
         let active_count = self.num_active_workers.fetch_add(1, Ordering::Relaxed);
         // This is the only thread that adds to the count, hence this check is sufficient.
         if active_count + 1 == usize::MAX {
@@ -93,6 +96,8 @@ impl ScopeData {
         if unwinding {
             self.fail_flag.store(true, Ordering::Relaxed);
         }
+        // In case the join handle is simply dropped, this would not happen-before the load in `wait_for_workers`.
+        // Hence, we use Release semantics here. For loading, relaxed is sufficient, see comment in `start_worker`.
         if self.num_active_workers.fetch_sub(1, Ordering::Release) == 1 {
             // Unpark if we were the last running thread
             self.main_thread.unpark();

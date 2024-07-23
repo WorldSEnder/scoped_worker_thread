@@ -246,8 +246,8 @@ impl<'thread> Worker<'thread> {
         let their_packet: Arc<dyn UnitOfWork + Send + Sync> = our_packet.clone();
         // SAFETY: we merely prolong the lifetime of the borrow. This lifetime is threaded into the ClaimedWorker struct.
         let their_packet = unsafe { Arc::from_raw(Arc::into_raw(their_packet) as *mut _) };
-        let item = WorkItem::Task(their_packet);
-        let barrier = self.control.send(item);
+        let work = WorkItem::Task(their_packet);
+        let barrier = self.control.send(work);
         ClaimedWorker {
             barrier,
             packet: our_packet,
