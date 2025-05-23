@@ -239,7 +239,12 @@ impl<'thread> Worker<'thread> {
         let our_packet = Arc::new(packet);
         let their_packet: Arc<dyn UnitOfWork + Send + Sync> = our_packet.clone();
         // SAFETY: we merely prolong the lifetime of the borrow. This lifetime is threaded into the ClaimedWorker struct.
-        let their_packet = unsafe { Arc::from_raw(Arc::into_raw(their_packet) as *mut _) };
+        let their_packet = unsafe {
+            Arc::from_raw(std::mem::transmute::<
+                *const (dyn UnitOfWork + Send + Sync + '_),
+                *const (dyn UnitOfWork + Send + Sync + 'static),
+            >(Arc::into_raw(their_packet)))
+        };
         let work = WorkItem::Task(their_packet);
         let barrier = self.control.send(work);
         ClaimedWorker {
